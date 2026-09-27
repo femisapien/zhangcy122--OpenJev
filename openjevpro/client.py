@@ -36,8 +36,10 @@ class OpenJevProClient:
         self.chat_template_kwargs = chat_template_kwargs or {}
         # Concurrency for order_invariant=True. Batching servers (llama.cpp, vLLM, SGLang) are not
         # batch-invariant: concurrent requests land in batches whose composition depends on thread
-        # timing, and near-tied candidates can then flip between identical calls. 1 = sequential
-        # and deterministic, at N x the latency; the default favours throughput.
+        # timing, so identical calls can return different probabilities and near ties can flip.
+        # 1 = sequential, which removes that source at N x the latency; the default favours
+        # throughput. Some model/server pairs also vary with prompt-cache state; see
+        # examples/repro_parallel_nondeterminism.py.
         self.order_invariant_max_workers = max(1, int(order_invariant_max_workers))
         self.mock = mock or (base_url and base_url.startswith("mock://"))
 
@@ -342,21 +344,28 @@ class OpenJevProClient:
         # See order_invariant_max_workers in __init__: >1 is faster but not deterministic on
         # batching servers.
         max_workers = min(len(options), self.order_invariant_max_workers)
-        extracted_logits: Dict[str, float] = {}
+        scores: Dict[str, float] = {}
 
+        # Dispatch in canonical (sorted) order, so the request sequence the server sees does not
+        # depend on the caller's option order. With max_workers=1 that keeps the prompt-cache
+        # history within a decision independent of caller order (it can still depend on the
+        # request that preceded the decision unless the server's prompt cache is off). It does
+        # NOT make concurrent dispatch deterministic: with max_workers>1, batch composition
+        # depends on thread timing, and identical calls drift regardless of dispatch order.
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_opt = {
                 executor.submit(self._score_single_candidate, state, opt, criteria): opt
-                for opt in options
+                for opt in sorted(options)
             }
-            for future in future_to_opt:
-                opt = future_to_opt[future]
+            for future, opt in future_to_opt.items():
                 try:
-                    score = future.result()
-                    extracted_logits[opt] = float(score)
+                    scores[opt] = float(future.result())
                 except Exception as e:
                     logger.warning("Scoring failed for candidate '%s': %s", opt, e)
-                    extracted_logits[opt] = -100.0
+                    scores[opt] = -100.0
+
+        # Report in the caller's order; winner selection is order-independent (_select_best).
+        extracted_logits: Dict[str, float] = {opt: scores[opt] for opt in options}
 
         calibrated_probs = self.calibrator.calibrate(extracted_logits)
         best_choice, confidence, degenerate = self._select_best(calibrated_probs)

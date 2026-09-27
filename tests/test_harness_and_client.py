@@ -628,6 +628,43 @@ class TestHarnessAndClient(unittest.TestCase):
                 self.assertEqual(decision.value, "a_opt")
                 self.assertFalse(decision.abstained)
 
+    def test_order_invariant_dispatches_in_canonical_order(self):
+        """The request sequence must not follow the caller's option order; results keep it."""
+        from concurrent.futures import Future
+        import openjevpro.client as client_module
+
+        submitted = []
+
+        class SyncExecutor:
+            def __init__(self, max_workers=None):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def submit(self, fn, *args):
+                submitted.append(args[1])
+                future = Future()
+                future.set_result(fn(*args))
+                return future
+
+        client = OpenJevProClient(base_url="http://mock-llm:8000/v1", backend="openai",
+                                  order_invariant_max_workers=1)
+        with patch.object(client_module, "ThreadPoolExecutor", SyncExecutor),              patch.object(OpenJevProClient, "_score_single_candidate", return_value=0.5):
+            client.decide_choice(state={"q": "x"}, candidates=["zeta", "alpha", "mid"], order_invariant=True)
+            first = list(submitted)
+            submitted.clear()
+            decision = client.decide_choice(state={"q": "x"}, candidates=["mid", "zeta", "alpha"],
+                                            order_invariant=True)
+            second = list(submitted)
+
+        self.assertEqual(first, sorted(first))
+        self.assertEqual(first, second)
+        self.assertEqual(list(decision.raw_logits), ["mid", "zeta", "alpha", "UNKNOWN"])
+
 if __name__ == "__main__":
     unittest.main()
 
