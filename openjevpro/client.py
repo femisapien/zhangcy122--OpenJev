@@ -75,24 +75,25 @@ class OpenJevProClient:
         """Pick the winner of a calibrated distribution without depending on candidate order.
 
         `max(probs, key=probs.get)` keeps the first of several equal maxima, i.e. whichever option
-        the caller happened to list first. Ties are broken on the sorted label instead. A fully
-        uniform distribution carries no signal at all (typically every candidate hit a fallback
-        score), so it is reported as degenerate and resolved to UNKNOWN rather than to an arbitrary
-        first option.
+        the caller happened to list first. Ties are broken on the sorted label instead, so
+        best_choice is always one of the candidates. A fully uniform distribution over two or more
+        candidates carries no signal at all (typically every candidate hit a fallback score) and is
+        flagged as degenerate; the caller decides whether that means UNKNOWN (abstention allowed)
+        or the tie-broken candidate (abstention disabled). A single candidate is never degenerate.
 
         Returns (best_choice, confidence, degenerate).
         """
         if not probs:
             return "UNKNOWN", 0.0, True
         top = max(probs.values())
-        if top - min(probs.values()) <= 1e-12:
+        best = max(sorted(probs), key=probs.get)
+        if len(probs) > 1 and top - min(probs.values()) <= 1e-12:
             logger.warning(
-                "All %d candidates received the same score, so the decision has no signal; "
-                "returning UNKNOWN. Check that the server returns logprobs for the answer tokens.",
+                "All %d candidates received the same score, so the decision has no signal. "
+                "Check that the server returns logprobs for the answer tokens.",
                 len(probs),
             )
-            return "UNKNOWN", top, True
-        best = max(sorted(probs), key=probs.get)
+            return best, top, True
         return best, probs[best], False
 
     def decide_choice(
@@ -359,9 +360,12 @@ class OpenJevProClient:
 
         calibrated_probs = self.calibrator.calibrate(extracted_logits)
         best_choice, confidence, degenerate = self._select_best(calibrated_probs)
+        if degenerate and allow_abstain:
+            # Uniform scores carry no signal: abstain instead of promoting an arbitrary label.
+            best_choice = "UNKNOWN"
 
         effective_thresh = self._get_effective_threshold(len(options))
-        abstained = degenerate
+        abstained = degenerate and allow_abstain
         if (allow_abstain and best_choice == "UNKNOWN") or confidence < effective_thresh:
             abstained = True
 
@@ -407,9 +411,12 @@ class OpenJevProClient:
 
         calibrated_probs = self.calibrator.calibrate(extracted_logits)
         best_choice, confidence, degenerate = self._select_best(calibrated_probs)
+        if degenerate and allow_abstain:
+            # Uniform scores carry no signal: abstain instead of promoting an arbitrary label.
+            best_choice = "UNKNOWN"
 
         effective_thresh = self._get_effective_threshold(len(options))
-        abstained = degenerate
+        abstained = degenerate and allow_abstain
         if (allow_abstain and best_choice == "UNKNOWN") or confidence < effective_thresh:
             abstained = True
 
@@ -480,9 +487,12 @@ class OpenJevProClient:
 
         calibrated_probs = self.calibrator.calibrate(extracted_logits)
         best_choice, confidence, degenerate = self._select_best(calibrated_probs)
+        if degenerate and allow_abstain:
+            # Uniform scores carry no signal: abstain instead of promoting an arbitrary label.
+            best_choice = "UNKNOWN"
 
         effective_thresh = self._get_effective_threshold(len(options))
-        abstained = degenerate
+        abstained = degenerate and allow_abstain
         if (allow_abstain and best_choice == "UNKNOWN") or confidence < effective_thresh:
             abstained = True
 
@@ -640,9 +650,12 @@ class OpenJevProClient:
 
         calibrated_probs = self.calibrator.calibrate(extracted_logits)
         best_choice, confidence, degenerate = self._select_best(calibrated_probs)
+        if degenerate and allow_abstain:
+            # Uniform scores carry no signal: abstain instead of promoting an arbitrary label.
+            best_choice = "UNKNOWN"
 
         effective_thresh = self._get_effective_threshold(len(options))
-        abstained = degenerate
+        abstained = degenerate and allow_abstain
         if (allow_abstain and best_choice == "UNKNOWN") or confidence < effective_thresh:
             abstained = True
 

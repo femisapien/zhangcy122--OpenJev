@@ -608,6 +608,26 @@ class TestHarnessAndClient(unittest.TestCase):
 
         self.assertEqual(seen, [1, 4])  # 3 candidates + UNKNOWN, capped by the default of 8
 
+    def test_single_candidate_is_not_degenerate(self):
+        """One candidate trivially has min == max; it must not be treated as a no-signal tie."""
+        self.assertEqual(OpenJevProClient._select_best({"only": 1.0}), ("only", 1.0, False))
+        client = OpenJevProClient(base_url="http://mock-llm:8000/v1", backend="openai")
+        with patch.object(OpenJevProClient, "_score_single_candidate", return_value=0.7):
+            decision = client.decide_choice(state={"q": "x"}, candidates=["only"],
+                                            allow_abstain=False, order_invariant=True)
+        self.assertEqual(decision.value, "only")
+        self.assertFalse(decision.abstained)
+
+    def test_uniform_scores_without_abstention_return_a_real_candidate(self):
+        """With allow_abstain=False a no-signal tie must still return a member of the caller's enum."""
+        client = OpenJevProClient(base_url="http://mock-llm:8000/v1", backend="openai")
+        with patch.object(OpenJevProClient, "_score_single_candidate", return_value=0.0):
+            for order in (["b_opt", "a_opt"], ["a_opt", "b_opt"]):
+                decision = client.decide_choice(state={"q": "x"}, candidates=order,
+                                                allow_abstain=False, order_invariant=True)
+                self.assertEqual(decision.value, "a_opt")
+                self.assertFalse(decision.abstained)
+
 if __name__ == "__main__":
     unittest.main()
 
