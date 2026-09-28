@@ -251,8 +251,9 @@ class TestHarnessAndClient(unittest.TestCase):
             payload = call_args[1]["json"]
             self.assertTrue(payload["logprobs"])
             self.assertEqual(payload["top_logprobs"], 20)
-            self.assertIn("extra_body", payload)
-            self.assertEqual(payload["extra_body"]["chat_template_kwargs"]["enable_thinking"], False)
+            # Sent at the top level: raw HTTP does not unpack an SDK-style "extra_body".
+            self.assertNotIn("extra_body", payload)
+            self.assertEqual(payload["chat_template_kwargs"]["enable_thinking"], False)
             self.assertEqual(len(payload["messages"]), 2)
 
     def test_decide_choice_openai_chat_fallback_to_completions(self):
@@ -537,6 +538,132 @@ class TestHarnessAndClient(unittest.TestCase):
             self.assertTrue(decision.abstained)
             self.assertEqual(decision.value, "UNKNOWN")
             self.assertEqual(decision.tentative_value, "card_arrival")
+
+    def test_order_invariant_sends_chat_template_kwargs_top_level(self):
+        """The isolated per-candidate calls must carry chat_template_kwargs at the top level too."""
+        client = OpenJevProClient(
+            base_url="http://mock-llm:8000/v1",
+            backend="openai",
+            chat_template_kwargs={"enable_thinking": False},
+        )
+        payloads = []
+
+        def mock_post(url, headers=None, json=None, timeout=None):
+            payloads.append(json)
+            mock_r = MagicMock()
+            mock_r.status_code = 200
+            mock_r.json.return_value = {"choices": [{"message": {"content": "A"}, "logprobs": {
+                "content": [{"top_logprobs": [{"token": "A", "logprob": -0.1}, {"token": "B", "logprob": -2.0}]}]}}]}
+            mock_r.raise_for_status = MagicMock()
+            return mock_r
+
+        with patch("requests.post", side_effect=mock_post):
+            client.decide_choice(state={"q": "x"}, candidates=["a", "b"], order_invariant=True)
+
+        self.assertGreater(len(payloads), 0)
+        for payload in payloads:
+            self.assertNotIn("extra_body", payload)
+            self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": False})
+
+    def test_all_candidates_tied_returns_unknown_not_first_option(self):
+        """A uniform distribution has no signal; it must not resolve to whichever option came first."""
+        client = OpenJevProClient(base_url="http://mock-llm:8000/v1", backend="openai")
+        with patch.object(OpenJevProClient, "_score_single_candidate", return_value=0.0):
+            for order in (["billing", "delivery", "pickup"], ["pickup", "delivery", "billing"]):
+                decision = client.decide_choice(state={"q": "x"}, candidates=order, order_invariant=True)
+                self.assertTrue(decision.abstained)
+                self.assertEqual(decision.value, "UNKNOWN")
+                self.assertIsNone(decision.tentative_value)
+
+    def test_tie_break_does_not_depend_on_candidate_order(self):
+        """Exactly tied leaders are resolved by label, so every ordering yields the same winner."""
+        client = OpenJevProClient(base_url="http://mock-llm:8000/v1", backend="openai",
+                                  abstain_threshold=0.0)
+        scores = {"b_opt": 1.0, "a_opt": 1.0, "c_opt": -1.0, "UNKNOWN": -3.0}
+        with patch.object(OpenJevProClient, "_score_single_candidate",
+                          side_effect=lambda state, opt, criteria: scores[opt]):
+            winners = {
+                client.decide_choice(state={"q": "x"}, candidates=order, order_invariant=True).value
+                for order in (["a_opt", "b_opt", "c_opt"], ["b_opt", "a_opt", "c_opt"], ["c_opt", "b_opt", "a_opt"])
+            }
+        self.assertEqual(winners, {"a_opt"})
+
+    def test_order_invariant_max_workers_is_honoured(self):
+        """order_invariant_max_workers=1 must run the per-candidate calls sequentially."""
+        import openjevpro.client as client_module
+
+        seen = []
+        real_executor = client_module.ThreadPoolExecutor
+
+        def recording_executor(max_workers=None):
+            seen.append(max_workers)
+            return real_executor(max_workers=max_workers)
+
+        with patch.object(client_module, "ThreadPoolExecutor", recording_executor),              patch.object(OpenJevProClient, "_score_single_candidate", return_value=0.5):
+            OpenJevProClient(base_url="http://mock-llm:8000/v1", backend="openai",
+                             order_invariant_max_workers=1).decide_choice(
+                state={"q": "x"}, candidates=["a", "b", "c"], order_invariant=True)
+            OpenJevProClient(base_url="http://mock-llm:8000/v1", backend="openai").decide_choice(
+                state={"q": "x"}, candidates=["a", "b", "c"], order_invariant=True)
+
+        self.assertEqual(seen, [1, 4])  # 3 candidates + UNKNOWN, capped by the default of 8
+
+    def test_single_candidate_is_not_degenerate(self):
+        """One candidate trivially has min == max; it must not be treated as a no-signal tie."""
+        self.assertEqual(OpenJevProClient._select_best({"only": 1.0}), ("only", 1.0, False))
+        client = OpenJevProClient(base_url="http://mock-llm:8000/v1", backend="openai")
+        with patch.object(OpenJevProClient, "_score_single_candidate", return_value=0.7):
+            decision = client.decide_choice(state={"q": "x"}, candidates=["only"],
+                                            allow_abstain=False, order_invariant=True)
+        self.assertEqual(decision.value, "only")
+        self.assertFalse(decision.abstained)
+
+    def test_uniform_scores_without_abstention_return_a_real_candidate(self):
+        """With allow_abstain=False a no-signal tie must still return a member of the caller's enum."""
+        client = OpenJevProClient(base_url="http://mock-llm:8000/v1", backend="openai")
+        with patch.object(OpenJevProClient, "_score_single_candidate", return_value=0.0):
+            for order in (["b_opt", "a_opt"], ["a_opt", "b_opt"]):
+                decision = client.decide_choice(state={"q": "x"}, candidates=order,
+                                                allow_abstain=False, order_invariant=True)
+                self.assertEqual(decision.value, "a_opt")
+                self.assertFalse(decision.abstained)
+
+    def test_order_invariant_dispatches_in_canonical_order(self):
+        """The request sequence must not follow the caller's option order; results keep it."""
+        from concurrent.futures import Future
+        import openjevpro.client as client_module
+
+        submitted = []
+
+        class SyncExecutor:
+            def __init__(self, max_workers=None):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def submit(self, fn, *args):
+                submitted.append(args[1])
+                future = Future()
+                future.set_result(fn(*args))
+                return future
+
+        client = OpenJevProClient(base_url="http://mock-llm:8000/v1", backend="openai",
+                                  order_invariant_max_workers=1)
+        with patch.object(client_module, "ThreadPoolExecutor", SyncExecutor),              patch.object(OpenJevProClient, "_score_single_candidate", return_value=0.5):
+            client.decide_choice(state={"q": "x"}, candidates=["zeta", "alpha", "mid"], order_invariant=True)
+            first = list(submitted)
+            submitted.clear()
+            decision = client.decide_choice(state={"q": "x"}, candidates=["mid", "zeta", "alpha"],
+                                            order_invariant=True)
+            second = list(submitted)
+
+        self.assertEqual(first, sorted(first))
+        self.assertEqual(first, second)
+        self.assertEqual(list(decision.raw_logits), ["mid", "zeta", "alpha", "UNKNOWN"])
 
 if __name__ == "__main__":
     unittest.main()

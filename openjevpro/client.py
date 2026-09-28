@@ -1,7 +1,7 @@
 import json
 import math
 import logging
-from typing import Dict, Any, Type, Union, List, Optional
+from typing import Dict, Any, Type, Union, List, Optional, Tuple
 from enum import Enum
 from concurrent.futures import ThreadPoolExecutor
 import requests
@@ -25,6 +25,7 @@ class OpenJevProClient:
         use_chat: bool = True,
         chat_template_kwargs: Optional[Dict[str, Any]] = None,
         mock: bool = False,
+        order_invariant_max_workers: int = 8,
     ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -33,6 +34,13 @@ class OpenJevProClient:
         self.abstain_threshold = abstain_threshold
         self.use_chat = use_chat
         self.chat_template_kwargs = chat_template_kwargs or {}
+        # Concurrency for order_invariant=True. Batching servers (llama.cpp, vLLM, SGLang) are not
+        # batch-invariant: concurrent requests land in batches whose composition depends on thread
+        # timing, so identical calls can return different probabilities and near ties can flip.
+        # 1 = sequential, which removes that source at N x the latency; the default favours
+        # throughput. Some model/server pairs also vary with prompt-cache state; see
+        # examples/repro_parallel_nondeterminism.py.
+        self.order_invariant_max_workers = max(1, int(order_invariant_max_workers))
         self.mock = mock or (base_url and base_url.startswith("mock://"))
 
         if self.mock:
@@ -63,6 +71,32 @@ class OpenJevProClient:
         if isinstance(self.abstain_threshold, str) and self.abstain_threshold.lower() == "auto":
             return 1.25 / max(n_options, 1)
         return float(self.abstain_threshold)
+
+    @staticmethod
+    def _select_best(probs: Dict[str, float]) -> Tuple[str, float, bool]:
+        """Pick the winner of a calibrated distribution without depending on candidate order.
+
+        `max(probs, key=probs.get)` keeps the first of several equal maxima, i.e. whichever option
+        the caller happened to list first. Ties are broken on the sorted label instead, so
+        best_choice is always one of the candidates. A fully uniform distribution over two or more
+        candidates carries no signal at all (typically every candidate hit a fallback score) and is
+        flagged as degenerate; the caller decides whether that means UNKNOWN (abstention allowed)
+        or the tie-broken candidate (abstention disabled). A single candidate is never degenerate.
+
+        Returns (best_choice, confidence, degenerate).
+        """
+        if not probs:
+            return "UNKNOWN", 0.0, True
+        top = max(probs.values())
+        best = max(sorted(probs), key=probs.get)
+        if len(probs) > 1 and top - min(probs.values()) <= 1e-12:
+            logger.warning(
+                "All %d candidates received the same score, so the decision has no signal. "
+                "Check that the server returns logprobs for the answer tokens.",
+                len(probs),
+            )
+            return best, top, True
+        return best, probs[best], False
 
     def decide_choice(
         self,
@@ -200,7 +234,10 @@ class OpenJevProClient:
                 "top_logprobs": 20,
             }
             if self.chat_template_kwargs:
-                chat_payload["extra_body"] = {"chat_template_kwargs": self.chat_template_kwargs}
+                # Top level, not under "extra_body": extra_body is an openai-python SDK convention
+                # that the SDK merges into the request body. Sent with requests it arrives as a
+                # literal key that llama.cpp and vLLM ignore, so enable_thinking=False never applied.
+                chat_payload["chat_template_kwargs"] = self.chat_template_kwargs
 
             endpoint_used = f"{self.base_url}/chat/completions"
             resp = requests.post(endpoint_used, headers=headers, json=chat_payload, timeout=30)
@@ -243,6 +280,12 @@ class OpenJevProClient:
         elif prob_b is not None:
             return -float(prob_b) - 5.0
         else:
+            logger.warning(
+                "Neither 'A' nor 'B' in top logprobs for candidate '%s' (top tokens: %s); "
+                "falling back to the generated text.",
+                candidate,
+                list(choice_logprobs.keys())[:10],
+            )
             # Fallback when logprobs are absent
             content_str = ""
             if "message" in choice_data and "content" in choice_data["message"]:
@@ -298,29 +341,40 @@ class OpenJevProClient:
                 len(options)
             )
 
-        max_workers = min(len(options), 8)
-        extracted_logits: Dict[str, float] = {}
+        # See order_invariant_max_workers in __init__: >1 is faster but not deterministic on
+        # batching servers.
+        max_workers = min(len(options), self.order_invariant_max_workers)
+        scores: Dict[str, float] = {}
 
+        # Dispatch in canonical (sorted) order, so the request sequence the server sees does not
+        # depend on the caller's option order. With max_workers=1 that keeps the prompt-cache
+        # history within a decision independent of caller order (it can still depend on the
+        # request that preceded the decision unless the server's prompt cache is off). It does
+        # NOT make concurrent dispatch deterministic: with max_workers>1, batch composition
+        # depends on thread timing, and identical calls drift regardless of dispatch order.
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_opt = {
                 executor.submit(self._score_single_candidate, state, opt, criteria): opt
-                for opt in options
+                for opt in sorted(options)
             }
-            for future in future_to_opt:
-                opt = future_to_opt[future]
+            for future, opt in future_to_opt.items():
                 try:
-                    score = future.result()
-                    extracted_logits[opt] = float(score)
+                    scores[opt] = float(future.result())
                 except Exception as e:
                     logger.warning("Scoring failed for candidate '%s': %s", opt, e)
-                    extracted_logits[opt] = -100.0
+                    scores[opt] = -100.0
+
+        # Report in the caller's order; winner selection is order-independent (_select_best).
+        extracted_logits: Dict[str, float] = {opt: scores[opt] for opt in options}
 
         calibrated_probs = self.calibrator.calibrate(extracted_logits)
-        best_choice = max(calibrated_probs, key=calibrated_probs.get)
-        confidence = calibrated_probs[best_choice]
+        best_choice, confidence, degenerate = self._select_best(calibrated_probs)
+        if degenerate and allow_abstain:
+            # Uniform scores carry no signal: abstain instead of promoting an arbitrary label.
+            best_choice = "UNKNOWN"
 
         effective_thresh = self._get_effective_threshold(len(options))
-        abstained = False
+        abstained = degenerate and allow_abstain
         if (allow_abstain and best_choice == "UNKNOWN") or confidence < effective_thresh:
             abstained = True
 
@@ -365,11 +419,13 @@ class OpenJevProClient:
             extracted_logits = {k: math.log(max(float(v), 1e-6)) for k, v in raw_probs.items()}
 
         calibrated_probs = self.calibrator.calibrate(extracted_logits)
-        best_choice = max(calibrated_probs, key=calibrated_probs.get)
-        confidence = calibrated_probs[best_choice]
+        best_choice, confidence, degenerate = self._select_best(calibrated_probs)
+        if degenerate and allow_abstain:
+            # Uniform scores carry no signal: abstain instead of promoting an arbitrary label.
+            best_choice = "UNKNOWN"
 
         effective_thresh = self._get_effective_threshold(len(options))
-        abstained = False
+        abstained = degenerate and allow_abstain
         if (allow_abstain and best_choice == "UNKNOWN") or confidence < effective_thresh:
             abstained = True
 
@@ -439,11 +495,13 @@ class OpenJevProClient:
             extracted_logits[opt] = float(raw_scores.get(opt, 0.0))
 
         calibrated_probs = self.calibrator.calibrate(extracted_logits)
-        best_choice = max(calibrated_probs, key=calibrated_probs.get)
-        confidence = calibrated_probs[best_choice]
+        best_choice, confidence, degenerate = self._select_best(calibrated_probs)
+        if degenerate and allow_abstain:
+            # Uniform scores carry no signal: abstain instead of promoting an arbitrary label.
+            best_choice = "UNKNOWN"
 
         effective_thresh = self._get_effective_threshold(len(options))
-        abstained = False
+        abstained = degenerate and allow_abstain
         if (allow_abstain and best_choice == "UNKNOWN") or confidence < effective_thresh:
             abstained = True
 
@@ -536,7 +594,10 @@ class OpenJevProClient:
                 "top_logprobs": 20,
             }
             if self.chat_template_kwargs:
-                chat_payload["extra_body"] = {"chat_template_kwargs": self.chat_template_kwargs}
+                # Top level, not under "extra_body": extra_body is an openai-python SDK convention
+                # that the SDK merges into the request body. Sent with requests it arrives as a
+                # literal key that llama.cpp and vLLM ignore, so enable_thinking=False never applied.
+                chat_payload["chat_template_kwargs"] = self.chat_template_kwargs
 
             endpoint_used = f"{self.base_url}/chat/completions"
             resp = requests.post(endpoint_used, headers=headers, json=chat_payload, timeout=30)
@@ -597,11 +658,13 @@ class OpenJevProClient:
             )
 
         calibrated_probs = self.calibrator.calibrate(extracted_logits)
-        best_choice = max(calibrated_probs, key=calibrated_probs.get)
-        confidence = calibrated_probs[best_choice]
+        best_choice, confidence, degenerate = self._select_best(calibrated_probs)
+        if degenerate and allow_abstain:
+            # Uniform scores carry no signal: abstain instead of promoting an arbitrary label.
+            best_choice = "UNKNOWN"
 
         effective_thresh = self._get_effective_threshold(len(options))
-        abstained = False
+        abstained = degenerate and allow_abstain
         if (allow_abstain and best_choice == "UNKNOWN") or confidence < effective_thresh:
             abstained = True
 
