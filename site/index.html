@@ -226,14 +226,17 @@
     </div>
 
     <!-- Editorial Main Headline -->
-    <h1 class="text-3xl sm:text-4xl md:text-5xl font-extrabold tracking-tight text-white leading-[1.28] mb-6 max-w-5xl mx-auto">
+    <h1 class="text-3xl sm:text-4xl md:text-5xl font-extrabold tracking-tight text-white leading-tight mb-4 max-w-5xl mx-auto">
       <span class="text-metallic inline-block" data-i18n="hero_title_prefix">面向 AI 智能体的确定性决策引擎</span>
-      <br class="hidden sm:inline">
-      <span class="text-neutral-100 text-glow-cyan inline-block mt-2 sm:mt-0" data-i18n-html="hero_title_suffix">Sub-35ms 离散路由 · 100% 排序无关 · <span class="whitespace-nowrap">双系统结晶</span></span>
     </h1>
 
     <!-- Subtitle -->
-    <p class="text-sm sm:text-base md:text-lg text-neutral-400 max-w-2xl mx-auto mb-8 leading-relaxed font-normal" data-i18n-html="hero_desc">
+    <p class="text-base sm:text-lg md:text-xl font-medium text-neutral-300 tracking-normal max-w-3xl mx-auto mb-6 leading-relaxed">
+      <span class="text-cyan-200/90 text-glow-cyan inline-block" data-i18n-html="hero_title_suffix">Sub-35ms 离散路由 · 100% 排序无关 · <span class="whitespace-nowrap">双系统结晶</span></span>
+    </p>
+
+    <!-- Description -->
+    <p class="text-sm sm:text-base text-neutral-400 max-w-2xl mx-auto mb-8 leading-relaxed font-normal" data-i18n-html="hero_desc">
       替代耗时较长、格式不可控的生成式路由调用。通过首 Token 条件似然提取实现 &lt;35ms 判定，从机制上避免 JSON 解析异常；支持选项排列无关性（任意排列胜者一致），并提供双系统决策机制：常规请求走快路径，边缘样本由推理模型分析并提炼为规则缓存。
     </p>
 
